@@ -1,5 +1,12 @@
 use super::{Block, DiscreteFactor, Graph, Node, NodeKind};
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+/// Source of unique program identifiers, for backend-side caching.
+static PROGRAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum number of states of a categorical node.
 ///
@@ -116,6 +123,10 @@ pub struct Program {
     pub(crate) weights: Vec<f32>,
     pub(crate) blocks: Vec<BlockProgram>,
     pub(crate) max_states: u32,
+    /// Unique identity of this compiled program.
+    pub(crate) id: u64,
+    /// Bumped by weight updates, so backends can re-upload only them.
+    pub(crate) weights_generation: u64,
 }
 
 impl Program {
@@ -215,6 +226,8 @@ impl Program {
             weights,
             blocks,
             max_states,
+            id: PROGRAM_COUNTER.fetch_add(1, Ordering::Relaxed),
+            weights_generation: 0,
         })
     }
 
@@ -236,6 +249,7 @@ impl Program {
         for factor in factors.iter() {
             self.weights.extend_from_slice(&factor.weights);
         }
+        self.weights_generation += 1;
         Ok(())
     }
 

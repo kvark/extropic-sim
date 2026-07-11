@@ -78,6 +78,17 @@ struct MomentData {
     moment_params: MomentParams,
 }
 
+/// GPU copies of the compiled program data, cached across runs.
+struct ProgramBuffers {
+    program_id: u64,
+    weights_generation: u64,
+    records: gpu::Buffer,
+    offsets: gpu::Buffer,
+    node_ids: gpu::Buffer,
+    weights: gpu::Buffer,
+    bases: Vec<BlockBases>,
+}
+
 struct Pipelines {
     max_states: u32,
     update_spins: gpu::ComputePipeline,
@@ -98,6 +109,7 @@ struct Pipelines {
 pub struct GpuSampler {
     context: gpu::Context,
     pipelines: Option<Pipelines>,
+    program: Option<ProgramBuffers>,
 }
 
 impl GpuSampler {
@@ -112,6 +124,7 @@ impl GpuSampler {
         Ok(Self {
             context,
             pipelines: None,
+            program: None,
         })
     }
 
@@ -169,6 +182,72 @@ impl GpuSampler {
         });
     }
 
+    /// Upload the program data, or reuse the copy of the previous run.
+    ///
+    /// Weight updates between runs re-upload only the weights buffer.
+    fn ensure_program(&mut self, program: &Program) {
+        if let Some(ref mut buffers) = self.program
+            && buffers.program_id == program.id
+        {
+            if buffers.weights_generation != program.weights_generation {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        program.weights.as_ptr() as *const u8,
+                        buffers.weights.data(),
+                        program.weights.len() * 4,
+                    );
+                }
+                buffers.weights_generation = program.weights_generation;
+            }
+            return;
+        }
+        if let Some(mut buffers) = self.program.take() {
+            self.destroy_program(&mut buffers);
+        }
+
+        // Concatenate the per-block program data.
+        let mut offsets = Vec::new();
+        let mut records = Vec::new();
+        let mut node_ids = Vec::new();
+        let bases: Vec<BlockBases> = program
+            .blocks
+            .iter()
+            .map(|block| {
+                let bases = BlockBases {
+                    offsets: offsets.len() as u32,
+                    records: records.len() as u32,
+                    node_ids: node_ids.len() as u32,
+                };
+                offsets.extend_from_slice(&block.offsets);
+                records.extend_from_slice(&block.records);
+                node_ids.extend_from_slice(&block.node_ids);
+                bases
+            })
+            .collect();
+
+        let context = &self.context;
+        self.program = Some(ProgramBuffers {
+            program_id: program.id,
+            weights_generation: program.weights_generation,
+            records: create_upload_buffer(context, "records", bytemuck::cast_slice(&records)),
+            offsets: create_upload_buffer(context, "offsets", bytemuck::cast_slice(&offsets)),
+            node_ids: create_upload_buffer(context, "node_ids", bytemuck::cast_slice(&node_ids)),
+            weights: create_upload_buffer(
+                context,
+                "weights",
+                bytemuck::cast_slice(&program.weights),
+            ),
+            bases,
+        });
+    }
+
+    fn destroy_program(&mut self, buffers: &mut ProgramBuffers) {
+        self.context.destroy_buffer(buffers.records);
+        self.context.destroy_buffer(buffers.offsets);
+        self.context.destroy_buffer(buffers.node_ids);
+        self.context.destroy_buffer(buffers.weights);
+    }
+
     fn destroy_pipelines(&mut self, pipelines: &mut Pipelines) {
         self.context
             .destroy_compute_pipeline(&mut pipelines.update_spins);
@@ -186,23 +265,32 @@ impl Drop for GpuSampler {
         if let Some(mut pipelines) = self.pipelines.take() {
             self.destroy_pipelines(&mut pipelines);
         }
+        if let Some(mut buffers) = self.program.take() {
+            self.destroy_program(&mut buffers);
+        }
     }
 }
 
-/// Submit the encoder and wait for completion once a chunk of
-/// dispatches has been recorded, then start recording the next chunk.
+/// Submit the encoder once a chunk of dispatches has been recorded,
+/// and start recording the next chunk while the GPU executes.
+///
+/// The encoder keeps two command buffers alive, so only the chunk
+/// before the one just submitted needs to be finished.
 fn flush_chunk(
     context: &gpu::Context,
     encoder: &mut gpu::CommandEncoder,
+    pending: &mut Option<gpu::SyncPoint>,
     ops_in_chunk: &mut usize,
 ) {
     if *ops_in_chunk < OPS_PER_SUBMIT {
         return;
     }
     let sync_point = context.submit(encoder);
-    context
-        .wait_for(&sync_point, !0)
-        .expect("lost the GPU device while sampling");
+    if let Some(previous) = pending.replace(sync_point) {
+        context
+            .wait_for(&previous, !0)
+            .expect("lost the GPU device while sampling");
+    }
     encoder.start();
     *ops_in_chunk = 0;
 }
@@ -387,53 +475,28 @@ impl GpuSampler {
     ) {
         validate_state(program, state);
         self.ensure_pipelines(program.max_states.max(2));
-
-        // Concatenate the per-block program data.
-        let mut offsets = Vec::new();
-        let mut records = Vec::new();
-        let mut node_ids = Vec::new();
-        let bases: Vec<BlockBases> = program
-            .blocks
-            .iter()
-            .map(|block| {
-                let bases = BlockBases {
-                    offsets: offsets.len() as u32,
-                    records: records.len() as u32,
-                    node_ids: node_ids.len() as u32,
-                };
-                offsets.extend_from_slice(&block.offsets);
-                records.extend_from_slice(&block.records);
-                node_ids.extend_from_slice(&block.node_ids);
-                bases
-            })
-            .collect();
+        self.ensure_program(program);
 
         let context = &self.context;
         let state_buffer =
             create_upload_buffer(context, "state", bytemuck::cast_slice(&state.values));
-        let records_buffer =
-            create_upload_buffer(context, "records", bytemuck::cast_slice(&records));
-        let offsets_buffer =
-            create_upload_buffer(context, "offsets", bytemuck::cast_slice(&offsets));
-        let node_ids_buffer =
-            create_upload_buffer(context, "node_ids", bytemuck::cast_slice(&node_ids));
-        let weights_buffer =
-            create_upload_buffer(context, "weights", bytemuck::cast_slice(&program.weights));
 
         let pipelines = self.pipelines.as_ref().unwrap();
+        let buffers = self.program.as_ref().unwrap();
         let mut encoder = context.create_command_encoder(gpu::CommandEncoderDesc {
             name: "gibbs",
-            buffer_count: 1,
+            buffer_count: 2,
         });
 
         let mut counter = 0u32;
         let mut ops_in_chunk = 0usize;
+        let mut pending = None;
         encoder.start();
 
         for op in run_ops(schedule) {
             if let RunOp::Step = op {
-                for (block, bases) in program.blocks.iter().zip(bases.iter()) {
-                    flush_chunk(context, &mut encoder, &mut ops_in_chunk);
+                for (block, bases) in program.blocks.iter().zip(buffers.bases.iter()) {
+                    flush_chunk(context, &mut encoder, &mut pending, &mut ops_in_chunk);
                     let (pipeline, states) = match block.kind {
                         BlockKind::Spin => (&pipelines.update_spins, 2),
                         BlockKind::Categorical { states } => {
@@ -447,10 +510,10 @@ impl GpuSampler {
                         0,
                         &UpdateData {
                             state: state_buffer.into(),
-                            records: records_buffer.into(),
-                            offsets: offsets_buffer.into(),
-                            node_ids: node_ids_buffer.into(),
-                            weights: weights_buffer.into(),
+                            records: buffers.records.into(),
+                            offsets: buffers.offsets.into(),
+                            node_ids: buffers.node_ids.into(),
+                            weights: buffers.weights.into(),
                             params: UpdateParams {
                                 seed,
                                 counter,
@@ -484,7 +547,7 @@ impl GpuSampler {
                 } => {
                     let mut node_ids_base = 0;
                     for block_layout in layout.blocks.iter() {
-                        flush_chunk(context, &mut encoder, &mut ops_in_chunk);
+                        flush_chunk(context, &mut encoder, &mut pending, &mut ops_in_chunk);
                         let mut pass = encoder.compute("record");
                         let mut pc = pass.with(&pipelines.record_states);
                         pc.bind(
@@ -516,7 +579,7 @@ impl GpuSampler {
                     nodes,
                     accum,
                 } => {
-                    flush_chunk(context, &mut encoder, &mut ops_in_chunk);
+                    flush_chunk(context, &mut encoder, &mut pending, &mut ops_in_chunk);
                     let mut pass = encoder.compute("moments");
                     let mut pc = pass.with(&pipelines.accumulate_moments);
                     pc.bind(
@@ -541,6 +604,11 @@ impl GpuSampler {
         }
 
         let sync_point = context.submit(&mut encoder);
+        if let Some(previous) = pending {
+            context
+                .wait_for(&previous, !0)
+                .expect("lost the GPU device while sampling");
+        }
         context
             .wait_for(&sync_point, !0)
             .expect("lost the GPU device while sampling");
@@ -556,9 +624,5 @@ impl GpuSampler {
 
         context.destroy_command_encoder(&mut encoder);
         context.destroy_buffer(state_buffer);
-        context.destroy_buffer(records_buffer);
-        context.destroy_buffer(offsets_buffer);
-        context.destroy_buffer(node_ids_buffer);
-        context.destroy_buffer(weights_buffer);
     }
 }
