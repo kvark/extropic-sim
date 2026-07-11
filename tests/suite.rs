@@ -344,3 +344,84 @@ fn cpu_determinism() {
     assert_eq!(run(42), run(42), "same seed must reproduce");
     assert_ne!(run(42), run(43), "different seeds must diverge");
 }
+
+fn gpu_sampler() -> sim::GpuSampler {
+    let sampler = sim::GpuSampler::new().expect("failed to init GPU");
+    println!("Testing on {}", sampler.device_name());
+    sampler
+}
+
+#[test]
+#[ignore]
+fn gpu_ising_chain() {
+    ising_chain(&mut gpu_sampler());
+}
+
+#[test]
+#[ignore]
+fn gpu_potts_chain() {
+    potts_chain(&mut gpu_sampler());
+}
+
+#[test]
+#[ignore]
+fn gpu_higher_order() {
+    higher_order(&mut gpu_sampler());
+}
+
+#[test]
+#[ignore]
+fn gpu_mixed_spin_categorical() {
+    mixed_spin_categorical(&mut gpu_sampler());
+}
+
+#[test]
+#[ignore]
+fn gpu_clamping() {
+    clamping(&mut gpu_sampler());
+}
+
+/// The CPU and GPU backends run the same algorithm with the same
+/// random number generator, so their sampled moments must agree
+/// closely for identical programs and seeds.
+#[test]
+#[ignore]
+fn gpu_matches_cpu() {
+    let mut graph = sim::Graph::new();
+    let nodes = graph.add_spins(16);
+    let biases: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.05).collect();
+    let weights: Vec<f32> = (0..15)
+        .map(|i| ((i * 7 + 3) % 11) as f32 * 0.1 - 0.5)
+        .collect();
+    let factors = [
+        sim::DiscreteFactor::bias(nodes.clone(), biases),
+        sim::DiscreteFactor::coupling(&nodes[..15], &nodes[1..], weights),
+    ];
+    let free_blocks = [
+        sim::Block::new(nodes.iter().copied().step_by(2).collect::<Vec<_>>()),
+        sim::Block::new(nodes.iter().copied().skip(1).step_by(2).collect::<Vec<_>>()),
+    ];
+    let program = sim::Program::compile(&graph, &free_blocks, &[], &factors).unwrap();
+    let schedule = sim::Schedule {
+        n_warmup: 100,
+        n_samples: 2000,
+        steps_per_sample: 2,
+    };
+    let moments: Vec<Vec<sim::Node>> = nodes.iter().map(|&node| vec![node]).collect();
+
+    let mut cpu_state = sim::State::random(&program, 64, 11);
+    let cpu_moments = sim::CpuSampler::new().accumulate_moments(
+        &program,
+        &schedule,
+        &mut cpu_state,
+        12,
+        &moments,
+    );
+    let mut gpu_state = sim::State::random(&program, 64, 11);
+    let gpu_moments =
+        gpu_sampler().accumulate_moments(&program, &schedule, &mut gpu_state, 12, &moments);
+
+    for (index, (&cpu, &gpu)) in cpu_moments.iter().zip(gpu_moments.iter()).enumerate() {
+        assert_close(gpu, cpu, 0.03, &format!("moment of node {index}"));
+    }
+}
