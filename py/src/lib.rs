@@ -449,14 +449,16 @@ fn sample_states(
         })
         .collect::<PyResult<_>>()?;
 
-    let samples = with_sampler(device, |sampler| {
-        sampler.sample_states(
-            &program.program,
-            &(*schedule).into(),
-            &mut state,
-            seed,
-            &observed,
-        )
+    let samples = py.detach(|| {
+        with_sampler(device, |sampler| {
+            sampler.sample_states(
+                &program.program,
+                &(*schedule).into(),
+                &mut state,
+                seed,
+                &observed,
+            )
+        })
     })?;
 
     // Convert to nested lists, dropping the chain axis for unbatched runs.
@@ -489,7 +491,9 @@ fn sample_states(
 /// average product of each tuple's spins (±1) over samples and chains.
 #[pyfunction]
 #[pyo3(signature = (seed, program, schedule, init_state, clamped_data, moment_nodes, device="auto"))]
+#[allow(clippy::too_many_arguments)]
 fn estimate_moments(
+    py: Python,
     seed: u32,
     program: &IsingSamplingProgram,
     schedule: &SamplingSchedule,
@@ -514,14 +518,16 @@ fn estimate_moments(
         })
         .collect::<PyResult<_>>()?;
 
-    with_sampler(device, |sampler| {
-        sampler.accumulate_moments(
-            &program.program,
-            &(*schedule).into(),
-            &mut state,
-            seed,
-            &tuples,
-        )
+    py.detach(|| {
+        with_sampler(device, |sampler| {
+            sampler.accumulate_moments(
+                &program.program,
+                &(*schedule).into(),
+                &mut state,
+                seed,
+                &tuples,
+            )
+        })
     })
 }
 
