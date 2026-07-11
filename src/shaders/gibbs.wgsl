@@ -51,8 +51,13 @@ fn random_uniform(seed: u32, step: u32, chain: u32, node: u32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn update_spins(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let thread = gid.x;
+fn update_spins(
+    @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(num_workgroups) group_counts: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
+    // Workgroups form a 2D grid to stay within per-dimension limits.
+    let thread = (group_id.y * group_counts.x + group_id.x) * 64u + local_index;
     if (thread >= params.node_count * params.n_chains) {
         return;
     }
@@ -87,8 +92,13 @@ fn update_spins(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn update_categorical(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let thread = gid.x;
+fn update_categorical(
+    @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(num_workgroups) group_counts: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
+    // Workgroups form a 2D grid to stay within per-dimension limits.
+    let thread = (group_id.y * group_counts.x + group_id.x) * 64u + local_index;
     if (thread >= params.node_count * params.n_chains) {
         return;
     }
@@ -163,8 +173,13 @@ var<storage, read_write> out_samples: array<u32>;
 var<uniform> record_params: RecordParams;
 
 @compute @workgroup_size(64)
-fn record_states(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let thread = gid.x;
+fn record_states(
+    @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(num_workgroups) group_counts: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
+    // Workgroups form a 2D grid to stay within per-dimension limits.
+    let thread = (group_id.y * group_counts.x + group_id.x) * 64u + local_index;
     let words = record_params.words_per_frame;
     if (thread >= words * record_params.n_chains) {
         return;
@@ -204,8 +219,13 @@ var<storage, read_write> accum: array<atomic<i32>>;
 var<uniform> moment_params: MomentParams;
 
 @compute @workgroup_size(64)
-fn accumulate_moments(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let thread = gid.x;
+fn accumulate_moments(
+    @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(num_workgroups) group_counts: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
+    // Workgroups form a 2D grid to stay within per-dimension limits.
+    let thread = (group_id.y * group_counts.x + group_id.x) * 64u + local_index;
     if (thread >= moment_params.n_moments * moment_params.n_chains) {
         return;
     }

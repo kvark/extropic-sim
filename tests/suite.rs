@@ -425,3 +425,51 @@ fn gpu_matches_cpu() {
         assert_close(gpu, cpu, 0.03, &format!("moment of node {index}"));
     }
 }
+
+/// Two 17-state categorical variables with a full coupling table,
+/// exercising state counts beyond small constants.
+fn wide_categorical(sampler: &mut dyn sim::Sampler) {
+    const STATES: u32 = 17;
+    let mut graph = sim::Graph::new();
+    let a = graph.add_categorical(STATES);
+    let b = graph.add_categorical(STATES);
+
+    let table: Vec<f32> = (0..STATES * STATES)
+        .map(|i| ((i * 31 + 7) % 23) as f32 * 0.05 - 0.5)
+        .collect();
+    let factors = [sim::DiscreteFactor::cat_coupling([a], [b], table)];
+    let free_blocks = [sim::Block::new([a]), sim::Block::new([b])];
+    let program = sim::Program::compile(&graph, &free_blocks, &[], &factors).unwrap();
+    let exact = Exact::new(&graph, &factors);
+
+    let schedule = sim::Schedule {
+        n_warmup: 100,
+        n_samples: 5000,
+        steps_per_sample: 1,
+    };
+    let mut state = sim::State::random(&program, 64, 13);
+    let observed = [sim::Block::new([a, b])];
+    let samples = sampler.sample_states(&program, &schedule, &mut state, 14, &observed);
+
+    for (position, node) in [(0u32, a), (1, b)] {
+        for value in 0..STATES {
+            assert_close(
+                empirical_marginal(&samples, 0, position, value),
+                exact.marginal(node, value),
+                0.015,
+                &format!("marginal of node {position} state {value}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn cpu_wide_categorical() {
+    wide_categorical(&mut sim::CpuSampler::new());
+}
+
+#[test]
+#[ignore]
+fn gpu_wide_categorical() {
+    wide_categorical(&mut gpu_sampler());
+}

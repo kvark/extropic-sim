@@ -185,6 +185,18 @@ impl Drop for GpuSampler {
     }
 }
 
+/// Split a thread count into a dispatch grid that stays within the
+/// guaranteed per-dimension workgroup limit.
+fn dispatch_grid(threads: u32) -> [u32; 3] {
+    const MAX_GROUPS: u32 = 0xFFFF;
+    let groups = threads.div_ceil(WORKGROUP_SIZE);
+    if groups <= MAX_GROUPS {
+        [groups, 1, 1]
+    } else {
+        [MAX_GROUPS, groups.div_ceil(MAX_GROUPS), 1]
+    }
+}
+
 fn create_upload_buffer(context: &gpu::Context, name: &str, contents: &[u8]) -> gpu::Buffer {
     let buffer = context.create_buffer(gpu::BufferDesc {
         name,
@@ -452,7 +464,7 @@ impl GpuSampler {
                             },
                         },
                     );
-                    pc.dispatch([(node_count * state.n_chains).div_ceil(WORKGROUP_SIZE), 1, 1]);
+                    pc.dispatch(dispatch_grid(node_count * state.n_chains));
                     counter += 1;
                     ops_in_chunk += 1;
                 }
@@ -494,12 +506,7 @@ impl GpuSampler {
                                 },
                             },
                         );
-                        pc.dispatch([
-                            (block_layout.words_per_frame * state.n_chains)
-                                .div_ceil(WORKGROUP_SIZE),
-                            1,
-                            1,
-                        ]);
+                        pc.dispatch(dispatch_grid(block_layout.words_per_frame * state.n_chains));
                         node_ids_base += block.len() as u32;
                         ops_in_chunk += 1;
                     }
@@ -533,7 +540,7 @@ impl GpuSampler {
                             },
                         },
                     );
-                    pc.dispatch([(count * state.n_chains).div_ceil(WORKGROUP_SIZE), 1, 1]);
+                    pc.dispatch(dispatch_grid(count * state.n_chains));
                     ops_in_chunk += 1;
                 }
             }
