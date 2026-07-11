@@ -9,14 +9,14 @@ use std::time::Instant;
 
 const STEPS: u32 = 200;
 
-fn build(
-    size: usize,
-) -> (
-    sim::Graph,
-    Vec<sim::Node>,
-    Vec<(sim::Node, sim::Node)>,
-    Vec<sim::Block>,
-) {
+struct Lattice {
+    graph: sim::Graph,
+    nodes: Vec<sim::Node>,
+    edges: Vec<(sim::Node, sim::Node)>,
+    blocks: Vec<sim::Block>,
+}
+
+fn build(size: usize) -> Lattice {
     let mut graph = sim::Graph::new();
     let nodes = graph.add_spins(size * size);
     let mut edges = Vec::with_capacity(2 * size * size);
@@ -28,7 +28,12 @@ fn build(
         }
     }
     let blocks = sim::color_blocks(&graph, &nodes, &edges);
-    (graph, nodes, edges, blocks)
+    Lattice {
+        graph,
+        nodes,
+        edges,
+        blocks,
+    }
 }
 
 fn run(sampler: &mut dyn sim::Sampler, program: &sim::Program, n_chains: u32, nodes: usize) -> f64 {
@@ -56,19 +61,19 @@ fn main() {
 
     println!("lattice   chains    CPU updates/s    GPU updates/s");
     for &(size, n_chains) in [(32usize, 16u32), (64, 64), (128, 128)].iter() {
-        let (graph, nodes, edges, blocks) = build(size);
+        let lattice = build(size);
         let model = IsingModel {
-            nodes: nodes.clone(),
-            biases: vec![0.1; nodes.len()],
-            edges: edges.clone(),
-            weights: vec![0.4; edges.len()],
+            nodes: lattice.nodes.clone(),
+            biases: vec![0.1; lattice.nodes.len()],
+            edges: lattice.edges.clone(),
+            weights: vec![0.4; lattice.edges.len()],
             beta: 1.0,
         };
-        let program = model.compile(&graph, &blocks, &[]).unwrap();
+        let program = model.compile(&lattice.graph, &lattice.blocks, &[]).unwrap();
 
-        let cpu_rate = run(&mut cpu, &program, n_chains, nodes.len());
+        let cpu_rate = run(&mut cpu, &program, n_chains, lattice.nodes.len());
         let gpu_rate = match gpu {
-            Some(ref mut sampler) => run(sampler, &program, n_chains, nodes.len()),
+            Some(ref mut sampler) => run(sampler, &program, n_chains, lattice.nodes.len()),
             None => 0.0,
         };
         println!(
