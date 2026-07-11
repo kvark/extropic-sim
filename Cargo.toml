@@ -1,0 +1,19 @@
+[package]
+name = "extropic-sim"
+description = "Portable simulator for thermodynamic computing"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+keywords = ["sampling", "gibbs", "ising", "gpu", "thermodynamic"]
+license = "MIT"
+repository = "https://github.com/kvark/extropic-sim"
+readme = "README.md"
+
+[dependencies]
+blade-graphics = "0.8"
+blade-macros = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
