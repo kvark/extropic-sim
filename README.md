@@ -22,7 +22,8 @@ dependency-light place to prototype such models today.
 - Statistically identical CPU and GPU backends behind one `Sampler` trait
 - Counter-based random numbers: reproducible runs for a fixed seed
 - Ising/Boltzmann-machine helpers: greedy graph coloring, Hinton
-  initialization, moment estimation, sampling-based KL gradients
+  initialization, moment estimation, sampling-based KL gradients,
+  in-place weight updates for training loops
 - Validated against exact Boltzmann distributions, Onsager's 2D Ising
   solution, and generative RBM training
 
@@ -84,3 +85,8 @@ software driver like lavapipe works):
 ```bash
 cargo test --release -- --ignored
 ```
+
+## Python
+
+THRML-flavored Python bindings live in [`py/`](py/), exposing nodes,
+blocks, `IsingEBM`, and `sample_states` backed by the same samplers.
