@@ -153,3 +153,109 @@ fn coloring_produces_valid_blocks() {
     assert_eq!(total, nodes.len());
     sim::Program::compile(&graph, &blocks, &[], &factors).unwrap();
 }
+
+#[test]
+fn rejects_mixed_state_cat_group() {
+    // Categorical group members must agree on the state count,
+    // since it shapes the weight tensor.
+    let mut graph = sim::Graph::new();
+    let c3 = graph.add_categorical(3);
+    let c5 = graph.add_categorical(5);
+    let factor = sim::DiscreteFactor::cat_bias(vec![c3, c5], vec![0.0; 6]);
+    let result = sim::Program::compile(
+        &graph,
+        &[sim::Block::new([c3]), sim::Block::new([c5])],
+        &[],
+        &[factor],
+    );
+    assert_eq!(result.err(), Some(sim::Error::MixedBlock(c3, c5)));
+}
+
+#[test]
+fn rejects_spin_in_cat_group_tail() {
+    let mut graph = sim::Graph::new();
+    let c3 = graph.add_categorical(3);
+    let spin = graph.add_spin();
+    let factor = sim::DiscreteFactor::cat_bias(vec![c3, spin], vec![0.0; 6]);
+    let result = sim::Program::compile(
+        &graph,
+        &[sim::Block::new([c3]), sim::Block::new([spin])],
+        &[],
+        &[factor],
+    );
+    assert_eq!(result.err(), Some(sim::Error::GroupKindMismatch(spin)));
+}
+
+#[test]
+fn updates_weights_in_place() {
+    let mut graph = sim::Graph::new();
+    let nodes = graph.add_spins(2);
+    let factors = [sim::DiscreteFactor::coupling(
+        [nodes[0]],
+        [nodes[1]],
+        vec![0.5],
+    )];
+    let blocks = [sim::Block::new([nodes[0]]), sim::Block::new([nodes[1]])];
+    let mut program = sim::Program::compile(&graph, &blocks, &[], &factors).unwrap();
+
+    let updated = [sim::DiscreteFactor::coupling(
+        [nodes[0]],
+        [nodes[1]],
+        vec![-0.5],
+    )];
+    program.update_weights(&updated).unwrap();
+
+    let bad = [
+        sim::DiscreteFactor::coupling(&nodes[..1], &nodes[1..], vec![0.1; 1]),
+        sim::DiscreteFactor::bias(nodes, vec![0.0; 2]),
+    ];
+    assert!(program.update_weights(&bad).is_err());
+}
+
+#[test]
+#[should_panic(expected = "out of range")]
+fn rejects_invalid_state_values() {
+    use sim::Sampler as _;
+    let mut graph = sim::Graph::new();
+    let nodes = graph.add_spins(2);
+    let factors = chain_factors(&nodes);
+    let blocks = [sim::Block::new([nodes[0]]), sim::Block::new([nodes[1]])];
+    let program = sim::Program::compile(&graph, &blocks, &[], &factors).unwrap();
+    let schedule = sim::Schedule {
+        n_warmup: 1,
+        n_samples: 1,
+        steps_per_sample: 1,
+    };
+    let mut state = sim::State::zeros(&program, 1);
+    state.set(0, nodes[0], 7);
+    let _ = sim::CpuSampler::new().sample_states(&program, &schedule, &mut state, 0, &[]);
+}
+
+#[test]
+#[should_panic(expected = "mixes spin and categorical")]
+fn rejects_mixed_observed_block() {
+    use sim::Sampler as _;
+    let mut graph = sim::Graph::new();
+    let spin = graph.add_spin();
+    let cat = graph.add_categorical(3);
+    let program = sim::Program::compile(
+        &graph,
+        &[sim::Block::new([spin]), sim::Block::new([cat])],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let schedule = sim::Schedule {
+        n_warmup: 0,
+        n_samples: 1,
+        steps_per_sample: 1,
+    };
+    let mut state = sim::State::zeros(&program, 1);
+    let _ = sim::CpuSampler::new().sample_states(
+        &program,
+        &schedule,
+        &mut state,
+        0,
+        &[sim::Block::new([spin, cat])],
+    );
+}

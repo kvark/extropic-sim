@@ -2,8 +2,9 @@ use blade_graphics as gpu;
 use gpu::ShaderData as _;
 
 use super::{
-    Block, Node, NodeKind, Program, Sampler, Samples, Schedule, State, program::BlockKind,
-    state::ObservedLayout,
+    Block, Node, NodeKind, Program, Sampler, Samples, Schedule, State,
+    program::BlockKind,
+    state::{ObservedLayout, RunOp, run_ops, validate_state},
 };
 
 /// Number of compute dispatches encoded per command buffer submission.
@@ -91,6 +92,9 @@ struct Pipelines {
 /// produce statistically equivalent chains on both backends. All chains
 /// advance in parallel on the GPU, and each block update is one compute
 /// dispatch, so wide models with many chains make the best use of it.
+///
+/// Sampler methods panic on invalid input (out-of-range state values,
+/// malformed observed blocks) and when the GPU device is lost.
 pub struct GpuSampler {
     context: gpu::Context,
     pipelines: Option<Pipelines>,
@@ -118,7 +122,7 @@ impl GpuSampler {
 
     fn ensure_pipelines(&mut self, max_states: u32) {
         if let Some(ref pipelines) = self.pipelines
-            && pipelines.max_states >= max_states
+            && pipelines.max_states == max_states
         {
             return;
         }
@@ -185,6 +189,24 @@ impl Drop for GpuSampler {
     }
 }
 
+/// Submit the encoder and wait for completion once a chunk of
+/// dispatches has been recorded, then start recording the next chunk.
+fn flush_chunk(
+    context: &gpu::Context,
+    encoder: &mut gpu::CommandEncoder,
+    ops_in_chunk: &mut usize,
+) {
+    if *ops_in_chunk < OPS_PER_SUBMIT {
+        return;
+    }
+    let sync_point = context.submit(encoder);
+    context
+        .wait_for(&sync_point, !0)
+        .expect("lost the GPU device while sampling");
+    encoder.start();
+    *ops_in_chunk = 0;
+}
+
 /// Split a thread count into a dispatch grid that stays within the
 /// guaranteed per-dimension workgroup limit.
 fn dispatch_grid(threads: u32) -> [u32; 3] {
@@ -219,7 +241,6 @@ struct BlockBases {
 #[derive(Clone, Copy)]
 enum Observation<'a> {
     States {
-        observed: &'a [Block],
         layout: &'a ObservedLayout,
         obs_node_ids: gpu::BufferPiece,
         out_samples: gpu::BufferPiece,
@@ -263,7 +284,6 @@ impl Sampler for GpuSampler {
             state,
             seed,
             Observation::States {
-                observed,
                 layout: &layout,
                 obs_node_ids: obs_buffer.into(),
                 out_samples: out_buffer.into(),
@@ -296,6 +316,10 @@ impl Sampler for GpuSampler {
         seed: u32,
         moments: &[Vec<Node>],
     ) -> Vec<f64> {
+        assert!(
+            schedule.n_samples as u64 * state.n_chains as u64 <= i32::MAX as u64,
+            "the GPU moment accumulator is 32-bit; reduce samples or chains",
+        );
         let mut moment_offsets = vec![0u32];
         let mut moment_nodes = Vec::new();
         for tuple in moments.iter() {
@@ -347,7 +371,7 @@ impl Sampler for GpuSampler {
         self.context.destroy_buffer(nodes_buffer);
         self.context.destroy_buffer(accum_buffer);
 
-        let count = (schedule.n_samples * state.n_chains) as f64;
+        let count = (schedule.n_samples as u64 * state.n_chains as u64) as f64;
         sums.iter().map(|&sum| sum as f64 / count).collect()
     }
 }
@@ -361,6 +385,7 @@ impl GpuSampler {
         seed: u32,
         observation: Observation,
     ) {
+        validate_state(program, state);
         self.ensure_pipelines(program.max_states.max(2));
 
         // Concatenate the per-block program data.
@@ -405,32 +430,10 @@ impl GpuSampler {
         let mut ops_in_chunk = 0usize;
         encoder.start();
 
-        // One entry per Gibbs step; `Some(index)` also records a sample.
-        let warmup = (0..schedule.n_warmup).map(|_| None);
-        let sampling = (0..schedule.n_samples).flat_map(|sample| {
-            let steps = if sample == 0 {
-                0
-            } else {
-                schedule.steps_per_sample.saturating_sub(1)
-            };
-            (0..steps).map(|_| None).chain(Some(Some(sample)))
-        });
-
-        for entry in warmup.chain(sampling) {
-            // Sample entries update the blocks first, except for sample 0,
-            // which records the state right after the warmup.
-            let update = match entry {
-                None => true,
-                Some(sample) => sample != 0 && schedule.steps_per_sample != 0,
-            };
-            if update {
+        for op in run_ops(schedule) {
+            if let RunOp::Step = op {
                 for (block, bases) in program.blocks.iter().zip(bases.iter()) {
-                    if ops_in_chunk >= OPS_PER_SUBMIT {
-                        let sync_point = context.submit(&mut encoder);
-                        context.wait_for(&sync_point, !0).unwrap();
-                        encoder.start();
-                        ops_in_chunk = 0;
-                    }
+                    flush_chunk(context, &mut encoder, &mut ops_in_chunk);
                     let (pipeline, states) = match block.kind {
                         BlockKind::Spin => (&pipelines.update_spins, 2),
                         BlockKind::Categorical { states } => {
@@ -470,22 +473,18 @@ impl GpuSampler {
                 }
             }
 
-            let Some(sample) = entry else { continue };
+            let RunOp::Record(sample) = op else {
+                continue;
+            };
             match observation {
                 Observation::States {
-                    observed,
                     layout,
                     obs_node_ids,
                     out_samples,
                 } => {
                     let mut node_ids_base = 0;
-                    for (block, block_layout) in observed.iter().zip(layout.blocks.iter()) {
-                        if ops_in_chunk >= OPS_PER_SUBMIT {
-                            let sync_point = context.submit(&mut encoder);
-                            context.wait_for(&sync_point, !0).unwrap();
-                            encoder.start();
-                            ops_in_chunk = 0;
-                        }
+                    for block_layout in layout.blocks.iter() {
+                        flush_chunk(context, &mut encoder, &mut ops_in_chunk);
                         let mut pass = encoder.compute("record");
                         let mut pc = pass.with(&pipelines.record_states);
                         pc.bind(
@@ -507,7 +506,7 @@ impl GpuSampler {
                             },
                         );
                         pc.dispatch(dispatch_grid(block_layout.words_per_frame * state.n_chains));
-                        node_ids_base += block.len() as u32;
+                        node_ids_base += block_layout.node_count;
                         ops_in_chunk += 1;
                     }
                 }
@@ -517,12 +516,7 @@ impl GpuSampler {
                     nodes,
                     accum,
                 } => {
-                    if ops_in_chunk >= OPS_PER_SUBMIT {
-                        let sync_point = context.submit(&mut encoder);
-                        context.wait_for(&sync_point, !0).unwrap();
-                        encoder.start();
-                        ops_in_chunk = 0;
-                    }
+                    flush_chunk(context, &mut encoder, &mut ops_in_chunk);
                     let mut pass = encoder.compute("moments");
                     let mut pc = pass.with(&pipelines.accumulate_moments);
                     pc.bind(
@@ -547,7 +541,9 @@ impl GpuSampler {
         }
 
         let sync_point = context.submit(&mut encoder);
-        context.wait_for(&sync_point, !0).unwrap();
+        context
+            .wait_for(&sync_point, !0)
+            .expect("lost the GPU device while sampling");
 
         // Read the final chain state back.
         unsafe {

@@ -81,6 +81,12 @@ impl DiscreteFactor {
     ///
     /// `values` holds one value per graph node: 0/1 for spins,
     /// the category index for categorical nodes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the factor is malformed (see [`Program::compile`]
+    /// (crate::Program::compile) for graceful validation) or if a
+    /// state value is out of range.
     pub fn energy(&self, graph: &Graph, values: &[u32]) -> f64 {
         let mut cat_strides = vec![0usize; self.cat_groups.len()];
         let mut instance_stride = 1usize;

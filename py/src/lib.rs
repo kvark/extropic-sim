@@ -28,10 +28,6 @@ use extropic_sim as sim;
 static NODE_COUNT: AtomicU32 = AtomicU32::new(0);
 static GPU_SAMPLER: Mutex<Option<sim::GpuSampler>> = Mutex::new(None);
 
-/// The counter value reserved for state initialization draws,
-/// matching `IsingModel::hinton_init`.
-const INIT_STEP: u32 = !1;
-
 /// A random variable taking values in {-1, +1}.
 #[pyclass(frozen, from_py_object)]
 #[derive(Clone, Copy)]
@@ -296,7 +292,14 @@ fn write_values(
 ) -> PyResult<()> {
     let rows: Vec<&[u32]> = match *values {
         BlockValues::Flat(ref row) => vec![row; n_chains as usize],
-        BlockValues::Batched(ref rows) => rows.iter().map(|row| row.as_slice()).collect(),
+        BlockValues::Batched(ref rows) => {
+            if rows.len() != n_chains as usize {
+                return Err(PyValueError::new_err(
+                    "inconsistent batch sizes across blocks",
+                ));
+            }
+            rows.iter().map(|row| row.as_slice()).collect()
+        }
     };
     for (chain, row) in rows.into_iter().enumerate() {
         if row.len() != nodes.len() {
@@ -320,9 +323,14 @@ fn initial_state(
     if clamped_data.len() != program.clamped_blocks.len() {
         return Err(PyValueError::new_err("one data entry per clamped block"));
     }
-    let batched = match infer_chains(init_state)? {
-        Some(count) => Some(count),
-        None => infer_chains(clamped_data)?,
+    let batched = match (infer_chains(init_state)?, infer_chains(clamped_data)?) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(PyValueError::new_err(
+                "inconsistent batch sizes across blocks",
+            ));
+        }
+        (Some(count), _) | (None, Some(count)) => Some(count),
+        (None, None) => None,
     };
     let n_chains = batched.unwrap_or(1);
     let mut state = sim::State::zeros(&program.program, n_chains);
@@ -339,7 +347,11 @@ fn with_sampler<R>(device: &str, run: impl FnOnce(&mut dyn sim::Sampler) -> R) -
     match device {
         "cpu" => Ok(run(&mut sim::CpuSampler::new())),
         "gpu" | "auto" => {
-            let mut guard = GPU_SAMPLER.lock().unwrap();
+            // A panic while sampling poisons the mutex; the sampler
+            // itself holds no state across runs, so keep using it.
+            let mut guard = GPU_SAMPLER
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             if guard.is_none() {
                 match sim::GpuSampler::new() {
                     Ok(sampler) => *guard = Some(sampler),
@@ -362,6 +374,9 @@ fn with_sampler<R>(device: &str, run: impl FnOnce(&mut dyn sim::Sampler) -> R) -
 /// Initialize block states from the marginal biases of the model:
 /// every spin is up with probability `sigmoid(2 * beta * b_i)`.
 ///
+/// Draws are keyed by the creation order of the nodes, so a script
+/// that builds its nodes deterministically gets reproducible states.
+///
 /// Returns one entry per block: a list of 0/1 values, or a batch of
 /// `n_chains` such lists when `n_chains` is given.
 #[pyfunction]
@@ -381,8 +396,7 @@ fn hinton_init(
         .collect();
     let draw = |chain: u32, node: PyNode| -> u32 {
         let bias = biases.get(&node.id()).copied().unwrap_or_default();
-        let p_up = 1.0 / (1.0 + (-2.0 * ebm.beta * bias).exp());
-        (sim::rng::uniform(seed, INIT_STEP, chain, node.id()) < p_up) as u32
+        sim::models::hinton_draw(seed, chain, node.id(), ebm.beta, bias)
     };
 
     let result: Vec<Py<PyAny>> = blocks

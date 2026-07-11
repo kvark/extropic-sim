@@ -1,8 +1,5 @@
 use crate::{Block, DiscreteFactor, Graph, Node, Program, Sampler, Schedule, State, rng};
 
-/// The counter value reserved for state initialization draws.
-const INIT_STEP: u32 = !1;
-
 /// First and second moments of an Ising model, estimated by sampling.
 pub struct IsingMoments {
     /// `<s_i>` for every node of the model, in order.
@@ -84,9 +81,8 @@ impl IsingModel {
         let mut state = State::zeros(program, n_chains);
         for chain in 0..n_chains {
             for (&node, &bias) in self.nodes.iter().zip(self.biases.iter()) {
-                let p_up = 1.0 / (1.0 + (-2.0 * self.beta * bias).exp());
-                let u = rng::uniform(seed, INIT_STEP, chain, node.0);
-                state.set(chain, node, (u < p_up) as u32);
+                let value = hinton_draw(seed, chain, node.0, self.beta, bias);
+                state.set(chain, node, value);
             }
         }
         state
@@ -189,4 +185,15 @@ pub fn color_blocks(graph: &Graph, nodes: &[Node], edges: &[(Node, Node)]) -> Ve
         block_nodes[color].push(node);
     }
     block_nodes.into_iter().map(Block::new).collect()
+}
+
+/// A single draw of Hinton initialization: up with probability
+/// `sigmoid(2 * beta * bias)`, from the reserved counter stream.
+///
+/// The building block of [`IsingModel::hinton_init`], exposed so
+/// other frontends produce bit-identical initial states.
+pub fn hinton_draw(seed: u32, chain: u32, node_index: u32, beta: f32, bias: f32) -> u32 {
+    let p_up = 1.0 / (1.0 + (-2.0 * beta * bias).exp());
+    let u = rng::uniform(seed, rng::STEP_HINTON_INIT, chain, node_index);
+    (u < p_up) as u32
 }

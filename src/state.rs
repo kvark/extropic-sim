@@ -13,6 +13,32 @@ pub struct Schedule {
     pub steps_per_sample: u32,
 }
 
+/// One entry of the unrolled run: advance the chains by one Gibbs
+/// step, or record the sample with the given index.
+///
+/// Both sampler backends execute the schedule through [`run_ops`],
+/// so their chains stay in lockstep by construction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RunOp {
+    Step,
+    Record(u32),
+}
+
+/// Unroll a schedule into the shared operation sequence: warmup
+/// steps, a sample right after the warmup, and `steps_per_sample`
+/// steps before each subsequent sample.
+pub(crate) fn run_ops(schedule: &Schedule) -> impl Iterator<Item = RunOp> {
+    let warmup = (0..schedule.n_warmup).map(|_| RunOp::Step);
+    let steps_per_sample = schedule.steps_per_sample;
+    let sampling = (0..schedule.n_samples).flat_map(move |sample| {
+        let steps = if sample == 0 { 0 } else { steps_per_sample };
+        (0..steps)
+            .map(|_| RunOp::Step)
+            .chain(Some(RunOp::Record(sample)))
+    });
+    warmup.chain(sampling)
+}
+
 /// Dense state of a batch of independent sampling chains.
 ///
 /// Holds one value per node per chain: 0/1 for spin nodes,
@@ -26,11 +52,22 @@ pub struct State {
 
 impl State {
     /// Create an all-zero state for `n_chains` chains.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_chains` is zero, or if the total number of values
+    /// doesn't fit in 32 bits of addressing.
     pub fn zeros(program: &Program, n_chains: u32) -> Self {
+        let n_nodes = program.node_count() as u32;
+        assert!(n_chains > 0, "at least one chain is required");
+        assert!(
+            n_nodes as u64 * n_chains as u64 <= u32::MAX as u64,
+            "the state of {n_nodes} nodes times {n_chains} chains exceeds 32-bit addressing",
+        );
         Self {
             n_chains,
-            n_nodes: program.node_count() as u32,
-            values: vec![0; program.node_count() * n_chains as usize],
+            n_nodes,
+            values: vec![0; n_nodes as usize * n_chains as usize],
         }
     }
 
@@ -39,7 +76,7 @@ impl State {
         let mut state = Self::zeros(program, n_chains);
         for chain in 0..n_chains {
             for (index, kind) in program.node_kinds.iter().enumerate() {
-                let u = rng::uniform(seed, !0, chain, index as u32);
+                let u = rng::uniform(seed, rng::STEP_RANDOM_INIT, chain, index as u32);
                 let value = (u * kind.state_count() as f32) as u32;
                 state.set(chain, Node(index as u32), value);
             }
@@ -52,14 +89,25 @@ impl State {
         self.n_chains
     }
 
+    fn index(&self, chain: u32, node: Node) -> usize {
+        assert!(node.0 < self.n_nodes, "{node:?} is not part of the state");
+        assert!(chain < self.n_chains, "chain {chain} is out of range");
+        (chain * self.n_nodes + node.0) as usize
+    }
+
     /// Value of a node in one chain.
     pub fn get(&self, chain: u32, node: Node) -> u32 {
-        self.values[(chain * self.n_nodes + node.0) as usize]
+        self.values[self.index(chain, node)]
     }
 
     /// Set the value of a node in one chain.
+    ///
+    /// The value must be valid for the kind of the node: 0/1 for
+    /// spins, less than the state count for categorical nodes.
+    /// Samplers reject states holding out-of-range values.
     pub fn set(&mut self, chain: u32, node: Node, value: u32) {
-        self.values[(chain * self.n_nodes + node.0) as usize] = value;
+        let index = self.index(chain, node);
+        self.values[index] = value;
     }
 
     /// Assign per-node values of a block, identically in every chain.
@@ -77,6 +125,25 @@ impl State {
     pub(crate) fn chain_values(&self, chain: u32) -> &[u32] {
         let base = (chain * self.n_nodes) as usize;
         &self.values[base..base + self.n_nodes as usize]
+    }
+}
+
+/// Check that a state is compatible with a program and all its
+/// values are in range, so that both backends see the same input.
+pub(crate) fn validate_state(program: &Program, state: &State) {
+    assert_eq!(
+        state.n_nodes as usize,
+        program.node_count(),
+        "the state doesn't match the node count of the program",
+    );
+    for chain in 0..state.n_chains {
+        let values = state.chain_values(chain);
+        for (index, (&value, kind)) in values.iter().zip(program.node_kinds.iter()).enumerate() {
+            assert!(
+                value < kind.state_count(),
+                "value {value} of node {index} in chain {chain} is out of range for {kind:?}",
+            );
+        }
     }
 }
 
@@ -100,13 +167,31 @@ pub(crate) struct ObservedLayout {
 }
 
 impl ObservedLayout {
+    /// Lay out storage for the observed blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an observed block is empty, mixes spin and
+    /// categorical nodes, references a node outside the program,
+    /// or if the total storage exceeds 32-bit addressing.
     pub fn new(program: &Program, observed: &[Block], n_samples: u32, n_chains: u32) -> Self {
-        let n_frames = n_samples * n_chains;
-        let mut base = 0;
+        let n_frames = n_samples as u64 * n_chains as u64;
+        let mut base = 0u64;
         let blocks = observed
             .iter()
             .map(|block| {
-                let is_spin = program.node_kinds[block.nodes[0].index()] == NodeKind::Spin;
+                let &first = block
+                    .nodes
+                    .first()
+                    .expect("observed blocks must not be empty");
+                let is_spin = program.node_kinds[first.index()] == NodeKind::Spin;
+                for &node in block.nodes.iter() {
+                    assert_eq!(
+                        program.node_kinds[node.index()] == NodeKind::Spin,
+                        is_spin,
+                        "observed block mixes spin and categorical nodes",
+                    );
+                }
                 let node_count = block.len() as u32;
                 let words_per_frame = if is_spin {
                     node_count.div_ceil(32)
@@ -114,18 +199,23 @@ impl ObservedLayout {
                     node_count
                 };
                 let layout = ObservedBlockLayout {
-                    base,
+                    base: base as u32,
                     words_per_frame,
                     is_spin,
                     node_count,
                 };
-                base += words_per_frame * n_frames;
+                base += words_per_frame as u64 * n_frames;
+                assert!(
+                    base <= u32::MAX as u64,
+                    "sample storage exceeds 32-bit addressing; \
+                     reduce the sample count, chains, or observed nodes",
+                );
                 layout
             })
             .collect();
         Self {
             blocks,
-            total_words: base,
+            total_words: base as u32,
         }
     }
 }

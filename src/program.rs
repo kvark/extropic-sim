@@ -218,6 +218,27 @@ impl Program {
         })
     }
 
+    /// Replace the weight values of the program without recompiling.
+    ///
+    /// The factors must have the same node structure as the ones the
+    /// program was compiled from; only the weight values may differ.
+    /// The record streams reference weights by index, so this is all
+    /// that a training loop needs between epochs.
+    pub fn update_weights(&mut self, factors: &[DiscreteFactor]) -> Result<(), Error> {
+        let total = factors.iter().map(|factor| factor.weights.len()).sum();
+        if self.weights.len() != total {
+            return Err(Error::WeightLengthMismatch {
+                expected: self.weights.len(),
+                actual: total,
+            });
+        }
+        self.weights.clear();
+        for factor in factors.iter() {
+            self.weights.extend_from_slice(&factor.weights);
+        }
+        Ok(())
+    }
+
     /// Total number of nodes in the source graph.
     pub fn node_count(&self) -> usize {
         self.node_kinds.len()
@@ -252,8 +273,35 @@ fn block_kind(graph: &Graph, block: &Block) -> Result<BlockKind, Error> {
     Ok(kind)
 }
 
-/// Iterate over the tail node ids of a record stream.
-fn record_tail_ids(records: &[u32]) -> impl Iterator<Item = u32> + '_ {
+/// A single decoded record of the update stream.
+pub(crate) struct Record<'a> {
+    pub weight_base: u32,
+    pub head_stride: u32,
+    pub spin_tails: &'a [u32],
+    /// Pairs of (node id, weight stride).
+    pub cat_tails: &'a [u32],
+}
+
+impl Record<'_> {
+    /// The spin product of the tails and the resolved weight index,
+    /// given the dense per-node state of one chain.
+    pub fn evaluate(&self, values: &[u32]) -> (f32, u32) {
+        let mut product = 1.0f32;
+        for &tail in self.spin_tails.iter() {
+            product *= values[tail as usize] as f32 * 2.0 - 1.0;
+        }
+        let mut index = self.weight_base;
+        for pair in self.cat_tails.chunks(2) {
+            index += values[pair[0] as usize] * pair[1];
+        }
+        (product, index)
+    }
+}
+
+/// Decode a record stream. The canonical CPU-side parser of the
+/// format documented on [`BlockProgram`]; the GPU-side counterpart
+/// lives in `shaders/gibbs.wgsl`.
+pub(crate) fn parse_records<'a>(records: &'a [u32]) -> impl Iterator<Item = Record<'a>> {
     let mut cursor = 0;
     std::iter::from_fn(move || {
         if cursor >= records.len() {
@@ -261,16 +309,28 @@ fn record_tail_ids(records: &[u32]) -> impl Iterator<Item = u32> + '_ {
         }
         let spin_count = (records[cursor + 2] & 0xFFFF) as usize;
         let cat_count = (records[cursor + 2] >> 16) as usize;
-        let base = cursor + RECORD_HEADER_WORDS;
-        let spin_ids = records[base..base + spin_count].iter().copied();
-        let cat_ids = records[base + spin_count..base + spin_count + 2 * cat_count]
-            .chunks(2)
-            .map(|pair| pair[0])
-            .collect::<Vec<_>>();
-        cursor = base + spin_count + 2 * cat_count;
-        Some(spin_ids.chain(cat_ids))
+        let tail_base = cursor + RECORD_HEADER_WORDS;
+        let record = Record {
+            weight_base: records[cursor],
+            head_stride: records[cursor + 1],
+            spin_tails: &records[tail_base..tail_base + spin_count],
+            cat_tails: &records[tail_base + spin_count..tail_base + spin_count + 2 * cat_count],
+        };
+        cursor = tail_base + spin_count + 2 * cat_count;
+        Some(record)
     })
-    .flatten()
+}
+
+/// Iterate over the tail node ids of a record stream.
+fn record_tail_ids(records: &[u32]) -> impl Iterator<Item = u32> + '_ {
+    parse_records(records).flat_map(|record| {
+        record
+            .spin_tails
+            .iter()
+            .copied()
+            .chain(record.cat_tails.chunks(2).map(|pair| pair[0]))
+            .collect::<Vec<_>>()
+    })
 }
 
 fn compile_factor(
@@ -304,18 +364,28 @@ fn compile_factor(
     }
 
     // Row-major strides of the categorical axes of the weight tensor.
+    // Nodes sharing an axis must agree on the state count, since it
+    // determines the shape of the weight tensor.
     let mut cat_strides = vec![0u32; factor.cat_groups.len()];
     let mut instance_stride = 1u32;
     for (stride, block) in cat_strides.iter_mut().zip(factor.cat_groups.iter()).rev() {
         *stride = instance_stride;
         let &first = block.nodes.first().unwrap();
-        match graph.node_kind(first) {
+        let group_states = match graph.node_kind(first) {
             NodeKind::Categorical { states } if (2..=MAX_CATEGORICAL_STATES).contains(&states) => {
-                instance_stride *= states;
+                states
             }
             NodeKind::Categorical { .. } => return Err(Error::BadStateCount(first)),
             NodeKind::Spin => return Err(Error::GroupKindMismatch(first)),
+        };
+        for &node in block.nodes[1..].iter() {
+            match graph.node_kind(node) {
+                NodeKind::Categorical { states } if states == group_states => {}
+                NodeKind::Categorical { .. } => return Err(Error::MixedBlock(first, node)),
+                NodeKind::Spin => return Err(Error::GroupKindMismatch(node)),
+            }
         }
+        instance_stride *= group_states;
     }
     let expected = batch_len * instance_stride as usize;
     if factor.weights.len() != expected {

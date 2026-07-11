@@ -59,6 +59,21 @@ fn main() {
         None => println!("GPU: none"),
     }
 
+    // Warm the GPU pipelines up so the first row isn't skewed
+    // by shader compilation.
+    if let Some(ref mut sampler) = gpu {
+        let lattice = build(8);
+        let model = IsingModel {
+            nodes: lattice.nodes.clone(),
+            biases: vec![0.0; lattice.nodes.len()],
+            edges: lattice.edges.clone(),
+            weights: vec![0.1; lattice.edges.len()],
+            beta: 1.0,
+        };
+        let program = model.compile(&lattice.graph, &lattice.blocks, &[]).unwrap();
+        run(sampler, &program, 1, lattice.nodes.len());
+    }
+
     println!("lattice   chains    CPU updates/s    GPU updates/s");
     for &(size, n_chains) in [(32usize, 16u32), (64, 64), (128, 128)].iter() {
         let lattice = build(size);

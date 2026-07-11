@@ -97,15 +97,22 @@ fn main() {
         steps_per_sample: 2,
     };
 
+    // The programs are compiled once; training only touches weights.
+    let mut positive_program = model
+        .compile(
+            &graph,
+            std::slice::from_ref(&hidden_block),
+            std::slice::from_ref(&visible_block),
+        )
+        .unwrap();
+    let mut negative_program = model
+        .compile(&graph, &[visible_block.clone(), hidden_block.clone()], &[])
+        .unwrap();
+
     for epoch in 0..EPOCHS {
         let seed = epoch * 2;
-        let positive_program = model
-            .compile(
-                &graph,
-                std::slice::from_ref(&hidden_block),
-                std::slice::from_ref(&visible_block),
-            )
-            .unwrap();
+        positive_program.update_weights(&model.factors()).unwrap();
+        negative_program.update_weights(&model.factors()).unwrap();
         // One chain per training pattern, visible units clamped to it.
         let mut positive_state = model.hinton_init(&positive_program, patterns.len() as u32, seed);
         for (chain, pattern) in patterns.iter().enumerate() {
@@ -121,9 +128,6 @@ fn main() {
             seed,
         );
 
-        let negative_program = model
-            .compile(&graph, &[visible_block.clone(), hidden_block.clone()], &[])
-            .unwrap();
         let mut negative_state = model.hinton_init(&negative_program, 64, seed + 1);
         let negative = model.estimate_moments(
             sampler,
