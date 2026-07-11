@@ -98,3 +98,24 @@ jobs:
       - name: Run GPU tests
         if: matrix.name != 'Linux'
         run: cargo test --release -- --ignored --nocapture
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build extension module
+        run: |
+          cargo build --release -p extropic-sim-py
+          cp target/release/libextropic_sim_py.so extropic_sim.so
+
+      - name: Run binding tests
+        run: python3 py/tests/test_compat.py
+        env:
+          PYTHONPATH: .

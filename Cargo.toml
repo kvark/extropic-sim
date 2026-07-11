@@ -1,3 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["py"]
+
 [package]
 name = "extropic-sim"
 description = "Portable simulator for thermodynamic computing"

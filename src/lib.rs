@@ -70,7 +70,7 @@ mod gpu;
 mod graph;
 pub mod models;
 mod program;
-mod rng;
+pub mod rng;
 mod state;
 
 pub use cpu::CpuSampler;

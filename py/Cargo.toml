@@ -1,0 +1,16 @@
+[package]
+name = "extropic-sim-py"
+description = "Python bindings for extropic-sim, in the flavor of THRML"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kvark/extropic-sim"
+publish = false
+
+[lib]
+name = "extropic_sim_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+extropic-sim = { path = ".." }
+pyo3 = { version = "0.29", features = ["abi3-py310", "extension-module"] }
