@@ -128,3 +128,28 @@ fn clamped_head_records_are_skipped() {
     .unwrap();
     assert_eq!(program.block_count(), 1);
 }
+
+#[test]
+fn coloring_produces_valid_blocks() {
+    // A random-ish graph: coloring must produce a partition that
+    // compiles, i.e. with no intra-block interactions.
+    let mut graph = sim::Graph::new();
+    let nodes = graph.add_spins(20);
+    let mut edges = Vec::new();
+    for i in 0..nodes.len() {
+        for j in i + 1..nodes.len() {
+            if (i * 7 + j * 13) % 5 == 0 {
+                edges.push((nodes[i], nodes[j]));
+            }
+        }
+    }
+    let weights = vec![0.1; edges.len()];
+    let heads: Vec<_> = edges.iter().map(|&(a, _)| a).collect();
+    let tails: Vec<_> = edges.iter().map(|&(_, b)| b).collect();
+    let factors = [sim::DiscreteFactor::coupling(heads, tails, weights)];
+
+    let blocks = sim::color_blocks(&graph, &nodes, &edges);
+    let total: usize = blocks.iter().map(|block| block.len()).sum();
+    assert_eq!(total, nodes.len());
+    sim::Program::compile(&graph, &blocks, &[], &factors).unwrap();
+}

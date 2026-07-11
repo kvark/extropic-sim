@@ -68,6 +68,7 @@ mod cpu;
 mod factor;
 mod gpu;
 mod graph;
+pub mod models;
 mod program;
 mod rng;
 mod state;
@@ -76,6 +77,7 @@ pub use cpu::CpuSampler;
 pub use factor::{DiscreteFactor, total_energy};
 pub use gpu::GpuSampler;
 pub use graph::{Block, Graph, Node, NodeKind};
+pub use models::color_blocks;
 pub use program::{Error, MAX_CATEGORICAL_STATES, Program};
 pub use state::{Samples, Schedule, State};
 
